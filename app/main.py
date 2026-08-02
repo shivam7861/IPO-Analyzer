@@ -9,14 +9,21 @@ import logging
 import os
 import time
 import uuid
+from io import BytesIO
 from pathlib import Path
 from typing import Dict
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, ListFlowable
+
+from .analyzer import normalize_groq_key
 
 load_dotenv()
 
@@ -108,11 +115,10 @@ async def stream_analysis(task_id: str, request: Request, groq_key: str = ""):
         raise HTTPException(status_code=404, detail="Task not found.")
 
     task = tasks[task_id]
-    if groq_key:
-        task["groq_key"] = groq_key
-        logger.info("Groq API key received via query param for task %s", task_id)
-    elif os.environ.get("GROQ_API_KEY"):
-        logger.info("Using GROQ_API_KEY from environment for task %s", task_id)
+    normalized_key = normalize_groq_key(groq_key or os.environ.get("GROQ_API_KEY", ""))
+    if normalized_key:
+        task["groq_key"] = normalized_key
+        logger.info("Groq API key received for task %s", task_id)
     else:
         logger.warning("No Groq API key found for task %s — analysis will fail", task_id)
 
@@ -149,14 +155,173 @@ async def stream_analysis(task_id: str, request: Request, groq_key: str = ""):
 async def get_report(task_id: str):
     """Return the completed JSON report for a task."""
     logger.info("Report requested for task: %s", task_id)
-    if task_id not in tasks:
-        raise HTTPException(status_code=404, detail="Task not found.")
-    report = tasks[task_id].get("report")
+    report = _load_report_for_task(task_id)
     if report is None:
         logger.info("Report not ready yet for task: %s", task_id)
         raise HTTPException(status_code=202, detail="Analysis still in progress.")
     logger.info("Returning completed report for task: %s", task_id)
     return report
+
+
+@app.get("/api/download/{task_id}")
+async def download_report(task_id: str):
+    """Return the final analysis as a downloadable PDF report."""
+    logger.info("Download requested for task: %s", task_id)
+    report = _load_report_for_task(task_id)
+    if report is None:
+        raise HTTPException(status_code=202, detail="Analysis still in progress.")
+
+    pdf_bytes = build_download_pdf(report)
+    filename = f"{task_id}_ipo_report.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
+def _load_report_for_task(task_id: str):
+    """Load report from memory or from the saved JSON file on disk."""
+    if task_id in tasks:
+        report = tasks[task_id].get("report")
+        if report is not None:
+            return report
+
+    report_path = UPLOAD_DIR / f"{task_id}_report.json"
+    if report_path.exists():
+        try:
+            return json.loads(report_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            logger.warning("Could not decode report JSON at %s", report_path)
+    return None
+
+
+def build_download_report(report: dict) -> str:
+    """Create a plain-text report suitable for download."""
+    verdict = report.get("verdict", {}) if isinstance(report, dict) else {}
+    if not isinstance(verdict, dict):
+        verdict = {}
+
+    lines = [
+        "# IPO Analysis Report",
+        "",
+        "## Verdict",
+        f"- Verdict: {verdict.get('verdict', 'CAUTION')}",
+        f"- Overall Score: {verdict.get('overall_score', 'N/A')}/10",
+        f"- Summary: {verdict.get('verdict_summary', '')}",
+        f"- One-liner: {verdict.get('one_liner', '')}",
+        "",
+    ]
+
+    strengths = verdict.get("top_strengths") or []
+    weaknesses = verdict.get("top_weaknesses") or []
+    monitorables = verdict.get("key_monitorables") or []
+
+    if strengths:
+        lines.append("## Top Strengths")
+        for item in strengths:
+            lines.append(f"- {item}")
+        lines.append("")
+
+    if weaknesses:
+        lines.append("## Key Weaknesses")
+        for item in weaknesses:
+            lines.append(f"- {item}")
+        lines.append("")
+
+    if monitorables:
+        lines.append("## Post-listing Monitorables")
+        for item in monitorables:
+            lines.append(f"- {item}")
+        lines.append("")
+
+    lines.append("## Section Analysis")
+    for key, section in report.items():
+        if key == "verdict" or not isinstance(section, dict):
+            continue
+        label = section.get("label") or key.replace("_", " ").title()
+        score = section.get("score", "N/A")
+        summary = section.get("summary", "")
+        positives = section.get("positives") or []
+        negatives = section.get("negatives") or []
+        red_flags = section.get("red_flags") or []
+
+        lines.extend([
+            f"### {label}",
+            f"- Score: {score}/10",
+            f"- Summary: {summary}",
+        ])
+        if positives:
+            lines.append("- Positives:")
+            for item in positives:
+                lines.append(f"  - {item}")
+        if negatives:
+            lines.append("- Concerns:")
+            for item in negatives:
+                lines.append(f"  - {item}")
+        if red_flags:
+            lines.append("- Red Flags:")
+            for item in red_flags:
+                lines.append(f"  - {item}")
+        lines.append("")
+
+    return "\n".join(lines).strip() + "\n"
+
+
+def build_download_pdf(report: dict) -> bytes:
+    """Create a PDF version of the report for download."""
+    story = []
+    styles = getSampleStyleSheet()
+    title_style = styles["Title"]
+    heading_style = styles["Heading2"]
+    body_style = styles["BodyText"]
+
+    story.append(Paragraph("IPO Analysis Report", title_style))
+    story.append(Spacer(1, 12))
+
+    verdict = report.get("verdict", {}) if isinstance(report, dict) else {}
+    if not isinstance(verdict, dict):
+        verdict = {}
+
+    story.append(Paragraph(f"Verdict: {verdict.get('verdict', 'CAUTION')}", heading_style))
+    story.append(Paragraph(f"Overall Score: {verdict.get('overall_score', 'N/A')}/10", body_style))
+    story.append(Paragraph(f"Summary: {verdict.get('verdict_summary', '')}", body_style))
+    story.append(Paragraph(f"One-liner: {verdict.get('one_liner', '')}", body_style))
+    story.append(Spacer(1, 12))
+
+    strengths = verdict.get("top_strengths") or []
+    weaknesses = verdict.get("top_weaknesses") or []
+    monitorables = verdict.get("key_monitorables") or []
+
+    if strengths:
+        story.append(Paragraph("Top Strengths", heading_style))
+        story.append(ListFlowable([Paragraph(item, body_style) for item in strengths], bulletType="bullet", start='bullet'))
+        story.append(Spacer(1, 8))
+
+    if weaknesses:
+        story.append(Paragraph("Key Weaknesses", heading_style))
+        story.append(ListFlowable([Paragraph(item, body_style) for item in weaknesses], bulletType="bullet", start='bullet'))
+        story.append(Spacer(1, 8))
+
+    if monitorables:
+        story.append(Paragraph("Post-listing Monitorables", heading_style))
+        story.append(ListFlowable([Paragraph(item, body_style) for item in monitorables], bulletType="bullet", start='bullet'))
+        story.append(Spacer(1, 8))
+
+    story.append(Paragraph("Section Analysis", heading_style))
+    for key, section in report.items():
+        if key == "verdict" or not isinstance(section, dict):
+            continue
+        label = section.get("label") or key.replace("_", " ").title()
+        story.append(Paragraph(label, styles["Heading3"]))
+        story.append(Paragraph(f"Score: {section.get('score', 'N/A')}/10", body_style))
+        story.append(Paragraph(f"Summary: {section.get('summary', '')}", body_style))
+        story.append(Spacer(1, 6))
+
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter, title="IPO Analysis Report")
+    doc.build(story)
+    return buffer.getvalue()
 
 
 # ── Background analysis pipeline ───────────────────────────────────────────────
@@ -227,7 +392,7 @@ async def _run_analysis(task_id: str):
         task["status"] = "analyzing"
         logger.info("[%s] STEP 2/3 → Groq LLM analysis started (7 sections + verdict)", task_id)
 
-        groq_key = task.get("groq_key") or os.environ.get("GROQ_API_KEY", "")
+        groq_key = normalize_groq_key(task.get("groq_key") or os.environ.get("GROQ_API_KEY", ""))
         analyzer = IPOAnalyzer(sections, groq_key=groq_key)
 
         analysis_start = time.time()

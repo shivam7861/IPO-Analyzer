@@ -11,6 +11,13 @@ import os
 import re
 from typing import AsyncGenerator, Dict
 
+
+def normalize_groq_key(groq_key: str | None) -> str:
+    """Trim whitespace from the Groq API key and return an empty string if missing."""
+    if groq_key is None:
+        return ""
+    return str(groq_key).strip()
+
 from groq import AsyncGroq
 
 from .rag import retrieve_relevant_chunks
@@ -288,7 +295,7 @@ class IPOAnalyzer:
     """Runs all 7 section analyses + final verdict using Groq LLM."""
 
     def __init__(self, sections: Dict[str, str], groq_key: str | None = None):
-        api_key = groq_key or os.environ.get("GROQ_API_KEY", "")
+        api_key = normalize_groq_key(groq_key or os.environ.get("GROQ_API_KEY", ""))
         if not api_key:
             raise ValueError(
                 "GROQ_API_KEY is not set. Paste your key in the UI or add it to .env"
@@ -339,6 +346,7 @@ class IPOAnalyzer:
             logger.error(f"Verdict generation failed: {exc}")
             verdict = {"error": str(exc), "verdict": "CAUTION", "overall_score": 5}
 
+        self.all_analyses["verdict"] = verdict
         yield {"event": "verdict_complete", "data": json.dumps(verdict)}
 
     # ── Private helpers ───────────────────────────────────────────────────────
